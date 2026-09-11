@@ -1,0 +1,227 @@
+/**
+ * Backend da Central de Auditorias — Checklists — Google Apps Script
+ * Cole este código inteiro no editor de Apps Script (Extensões > Apps Script
+ * dentro da sua planilha), substituindo o conteúdo padrão. Depois implante
+ * como "App da Web" (veja o passo a passo enviado junto com este arquivo).
+ *
+ * A planilha precisa ter 5 abas, cada uma com os cabeçalhos certos na
+ * primeira linha (veja o passo a passo): "Checklists", "Itens",
+ * "Auditores", "Auditorias" e "Respostas".
+ */
+
+// Precisa ser EXATAMENTE igual à constante GESTOR_SECRET no painel HTML.
+// Se trocar uma, troque a outra também.
+var SECRET = 'auditoria2026';
+
+function doGet(e) {
+  var params = (e && e.parameter) || {};
+
+  // sorteio: dado uma disciplina, escolhe aleatoriamente 1 checklist ativo
+  // dessa disciplina e devolve ele já com os itens. Não exige senha —
+  // é a tela do auditor.
+  if (params.action === 'sorteio') {
+    var lib = loadLibrary_();
+    var disciplina = String(params.disciplina || '').trim();
+    var candidatos = lib.checklists.filter(function (c) {
+      return c.disciplina === disciplina && c.ativo;
+    });
+    if (!candidatos.length) {
+      return json_({ ok: false, error: 'Não existe nenhum checklist ativo cadastrado para essa disciplina.' });
+    }
+    var sorteado = candidatos[Math.floor(Math.random() * candidatos.length)];
+    var itens = lib.itens
+      .filter(function (i) { return i.checklist_id === sorteado.id; })
+      .sort(function (a, b) { return a.ordem - b.ordem; });
+    return json_({
+      ok: true,
+      checklist: { id: sorteado.id, nome: sorteado.nome, disciplina: sorteado.disciplina, itens: itens }
+    });
+  }
+
+  var isGestor = params.secret === SECRET;
+  var lib = loadLibrary_();
+  var out = {
+    checklists: lib.checklists,
+    itens: lib.itens,
+    auditores: lib.auditores
+  };
+
+  if (isGestor) {
+    // só o gestor enxerga as auditorias já realizadas e as respostas/evidências
+    out.auditorias = loadAuditorias_();
+    out.respostas = loadRespostas_();
+  }
+
+  return json_(out);
+}
+
+function doPost(e) {
+  try {
+    var payload = JSON.parse(e.postData.contents);
+
+    if (payload.type === 'cadastro') {
+      if (payload.secret !== SECRET) {
+        return json_({ ok: false, error: 'senha incorreta' });
+      }
+      saveLibrary_(payload.checklists || [], payload.itens || [], payload.auditores || []);
+      return json_({ ok: true });
+    }
+
+    if (payload.type === 'auditoria') {
+      var id = appendAuditoria_(payload.auditoria || {}, payload.respostas || []);
+      return json_({ ok: true, id: id });
+    }
+
+    return json_({ ok: false, error: 'tipo de operação desconhecido' });
+  } catch (err) {
+    return json_({ ok: false, error: String(err) });
+  }
+}
+
+// ---------- helpers ----------
+function json_(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+function sheet_(nome) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sh = ss.getSheetByName(nome);
+  if (!sh) throw new Error('Aba "' + nome + '" não encontrada na planilha.');
+  return sh;
+}
+
+function uid_() {
+  return Utilities.getUuid();
+}
+
+// ---------- leitura ----------
+function loadLibrary_() {
+  var chData = sheet_('Checklists').getDataRange().getValues();
+  var checklists = [];
+  for (var i = 1; i < chData.length; i++) {
+    var row = chData[i];
+    if (!row[0]) continue;
+    checklists.push({
+      id: String(row[0]).trim(),
+      disciplina: String(row[1] || '').trim(),
+      nome: String(row[2] || '').trim(),
+      ativo: String(row[3] || '').trim().toUpperCase() !== 'NAO'
+    });
+  }
+
+  var itData = sheet_('Itens').getDataRange().getValues();
+  var itens = [];
+  for (var j = 1; j < itData.length; j++) {
+    var irow = itData[j];
+    if (!irow[0] || !irow[2]) continue;
+    itens.push({
+      checklist_id: String(irow[0]).trim(),
+      ordem: Number(irow[1]) || 0,
+      item: String(irow[2]).trim()
+    });
+  }
+
+  var auData = sheet_('Auditores').getDataRange().getValues();
+  var auditores = [];
+  for (var k = 1; k < auData.length; k++) {
+    var arow = auData[k];
+    if (!arow[0]) continue;
+    auditores.push({
+      nome: String(arow[0]).trim(),
+      ativo: String(arow[1] || '').trim().toUpperCase() !== 'NAO'
+    });
+  }
+
+  return { checklists: checklists, itens: itens, auditores: auditores };
+}
+
+function loadAuditorias_() {
+  var data = sheet_('Auditorias').getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    out.push({
+      id: String(row[0]).trim(),
+      checklist_id: String(row[1] || '').trim(),
+      disciplina: String(row[2] || '').trim(),
+      checklist_nome: String(row[3] || '').trim(),
+      auditor: String(row[4] || '').trim(),
+      data: String(row[5] || '').trim(),
+      status: String(row[6] || '').trim()
+    });
+  }
+  return out;
+}
+
+function loadRespostas_() {
+  var data = sheet_('Respostas').getDataRange().getValues();
+  var out = [];
+  for (var i = 1; i < data.length; i++) {
+    var row = data[i];
+    if (!row[0]) continue;
+    out.push({
+      auditoria_id: String(row[0]).trim(),
+      ordem: Number(row[1]) || 0,
+      item: String(row[2] || '').trim(),
+      resultado: String(row[3] || '').trim(),
+      comentario: String(row[4] || '').trim()
+    });
+  }
+  return out;
+}
+
+// ---------- escrita ----------
+
+// cadastro do gestor: sobrescreve a biblioteca inteira de checklists/itens/auditores
+// (mesmo padrão do painel de qualidade: o front manda o estado completo e a
+// planilha é regravada do zero). NUNCA mexe nas abas Auditorias/Respostas.
+function saveLibrary_(checklists, itens, auditores) {
+  var chSheet = sheet_('Checklists');
+  chSheet.clearContents();
+  chSheet.appendRow(['id', 'disciplina', 'nome', 'ativo']);
+  checklists.forEach(function (c) {
+    chSheet.appendRow([c.id, c.disciplina, c.nome, c.ativo === false ? 'NAO' : 'SIM']);
+  });
+
+  var itSheet = sheet_('Itens');
+  itSheet.clearContents();
+  itSheet.appendRow(['checklist_id', 'ordem', 'item']);
+  itens.forEach(function (i) {
+    itSheet.appendRow([i.checklist_id, i.ordem, i.item]);
+  });
+
+  var auSheet = sheet_('Auditores');
+  auSheet.clearContents();
+  auSheet.appendRow(['nome', 'ativo']);
+  auditores.forEach(function (a) {
+    auSheet.appendRow([a.nome, a.ativo === false ? 'NAO' : 'SIM']);
+  });
+}
+
+// registro de uma auditoria concluída pelo auditor: acrescenta 1 linha em
+// Auditorias e N linhas em Respostas (uma por item do checklist sorteado).
+// Só ADICIONA linhas — nunca apaga nada, então concorrência entre auditores
+// diferentes preenchendo ao mesmo tempo é segura.
+function appendAuditoria_(auditoria, respostas) {
+  var id = uid_();
+  var auSheet = sheet_('Auditorias');
+  auSheet.appendRow([
+    id,
+    auditoria.checklist_id || '',
+    auditoria.disciplina || '',
+    auditoria.checklist_nome || '',
+    auditoria.auditor || '',
+    auditoria.data || new Date().toISOString(),
+    'concluida'
+  ]);
+
+  var reSheet = sheet_('Respostas');
+  var rows = respostas.map(function (r) {
+    return [id, r.ordem || 0, r.item || '', r.resultado || '', r.comentario || ''];
+  });
+  if (rows.length) {
+    reSheet.getRange(reSheet.getLastRow() + 1, 1, rows.length, 5).setValues(rows);
+  }
+  return id;
+}
